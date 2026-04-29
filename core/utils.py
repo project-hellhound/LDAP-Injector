@@ -11,7 +11,7 @@ from .models import Endpoint, Severity, ResponseClass, _TECHNIQUE_TO_FAMILY, _CV
 from .patterns import LDAP_ERRORS_RE, AUTH_SUCCESS_HIGH_RE, AUTH_SUCCESS_LOW_RE, AUTH_FAIL_RE, AUTH_FAIL_HTML_RE
 
 def now_iso() -> str: return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-def finding_id() -> str: return f"LDAPi-{uuid.uuid4().hex[:8].upper()}"
+def finding_id() -> str: return f"DNW-{uuid.uuid4().hex[:8].upper()}"
 
 def build_curl_poc(ep: Endpoint, param: str, payload: str, cookies: Optional[Dict[str, str]] = None, extra_headers: Optional[Dict[str, str]] = None) -> str:
     safe_pl = quote(payload, safe=""); cookie_str = f" -b '{'; '.join(f'{k}={v}' for k, v in cookies.items())}'" if cookies else ""
@@ -129,4 +129,4 @@ def print_finding_card(f: Any, idx: int = 0):
     print(f"\n{C.BRED}{C.BOLD}{p}CONFIRMED VULNERABILITY: LDAP Injection{C.RESET}")
     label("Endpoint", f.endpoint_url); label("Parameter", f.parameter_name); label("Payload", f.payload_raw); label("Severity", f.severity)
 
-BANNER = "LDAP-Injector v10.0"
+BANNER = "DNwatch v1.0"

@@ -1,6 +1,6 @@
-# Contributing to LDAP-Injector
+# Contributing to DNwatch
 
-We're excited that you're interested in contributing to LDAP-Injector!
+We're excited that you're interested in contributing to DNwatch!
 
 ## Development Guidelines
 

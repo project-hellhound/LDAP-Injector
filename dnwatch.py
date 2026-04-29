@@ -28,7 +28,7 @@ def _parse_auth_data(s: Optional[str]) -> Dict[str, str]:
     return dict(p.split("=", 1) for p in s.split("&") if "=" in p)
 
 def _parse_args():
-    p = argparse.ArgumentParser(prog="ldapi_injector", description="LDAP-Injector: Professional LDAP Injection Security Toolkit")
+    p = argparse.ArgumentParser(prog="dnwatch", description="DNwatch: Advanced LDAP Injection Security Toolkit")
     p.add_argument("target", help="Target base URL (e.g., http://nexus-corp.internal)")
     
     auth = p.add_argument_group("Authentication & Connection")
@@ -54,7 +54,7 @@ def _parse_args():
 
     out = p.add_argument_group("Output")
     out.add_argument("--output-dir", default=".", help="Directory to save findings")
-    out.add_argument("--findings", default="ldapi_findings.json", help="JSON output filename")
+    out.add_argument("--findings", default="dnwatch_findings.json", help="JSON output filename")
     out.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
     out.add_argument("-q", "--quiet", action="store_true", help="Disable banner and info logs")
 
