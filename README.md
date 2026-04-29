@@ -4,7 +4,6 @@
 
 <p align="center">
   <a href="https://python.org"><img src="https://img.shields.io/badge/python-3.7+-blue?style=for-the-badge&logo=python" alt="Python"></a>
-  <a href="https://github.com/project-hellhound-org/DNwatch/blob/main/LICENSE"><img src="https://img.shields.io/github/license/project-hellhound-org/DNwatch?style=for-the-badge" alt="License"></a>
   <img src="https://img.shields.io/badge/OS-Linux%20%7C%20Windows-blue?style=for-the-badge" alt="OS">
 </p>
 
