@@ -335,16 +335,39 @@ class HandoffFinding:
     parameter_name:          str
     auth_state:              str
     severity:                str
-    confidence:              int
-    verification_grade:      str
     payload_raw:             str
     payload_technique:       str
+    payload_tier:            str
+    verification_grade:      str
+    reproduction_confidence: int
     ldap_error_snippet:      Optional[str] = None
     curl_poc:                str           = ""
-    reproduction_confidence: int           = 0
-    impact_scenario:         str           = ""
-    exploiter_context:       Dict[str, Any] = field(default_factory=dict)
     oob_triggered:           bool          = False
+    cvss_score:              float         = 0.0
+    cvss_vector:             str           = ""
+    remediation_guidance:    str           = ""
+    exploiter_context:       Dict[str, Any] = field(default_factory=dict)
+    
+    # Extended context
+    payload_encoding:        str           = "raw"
+    verification_steps:      List[str]     = field(default_factory=list)
+    severity_reason:         str           = ""
+    baseline_response_class: str           = "STATIC"
+    injected_response_class: str           = "STATIC"
+    detection_signals:       List[str]     = field(default_factory=list)
+    diff_ratio:              float         = 0.0
+    timing_zscore:           float         = 0.0
+    timing_delta_ms:         int           = 0
+    filter_reflection:       Optional[str] = None
+    raw_http_request:        str           = ""
+    ldap_server_type:        str           = "generic"
+    framework_detected:      str           = "generic"
+    waf_detected:            bool          = False
+    survived_metacharacters: List[str]     = field(default_factory=list)
+    non_destructive_confirmed: bool        = True
+    second_order:            bool          = False
+    affected_ldap_attributes: List[str]    = field(default_factory=list)
+    schema_enumerated:       bool          = False
 
 _TECHNIQUE_TO_FAMILY = {
     "auth_bypass": "bypass", "ad_bypass": "bypass", "ol_bypass": "bypass", "spring_ldap": "bypass", "shiro_ldap": "bypass", "adsi_bypass": "bypass", "or_chain": "bypass", "null_byte": "bypass", "url_encoded": "bypass", "bool_true": "boolean", "bool_false": "boolean", "bool_enum": "boolean", "structural": "probe", "syntax": "probe", "wildcard": "probe", "oob_referral": "oob", "dn_inject": "dn_inject", "attr_harvest": "attr_harvest", "attr_inject": "attr_inject", "ad_enum": "enum", "ol_enum": "enum", "waf_url": "waf_bypass", "waf_hex": "waf_bypass", "second_order": "second_order", "cve_shiro": "bypass", "cve_spring": "bypass", "cve_null": "bypass", "cve_ldap3": "bypass", "cve_log4shell": "oob", "cve_nss": "bypass", "cve_nopac": "bypass", "cve_jboss": "bypass", "cve_manage": "bypass", "cve_vmware": "bypass", "cve_cisco": "bypass", "cve_openfire": "bypass", "cve_citrix": "bypass", "cve_confluence": "bypass",

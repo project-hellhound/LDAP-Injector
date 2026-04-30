@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from collections import defaultdict
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from .models import ScanConfig, AuthState, Endpoint
 from .utils import (
     AdaptiveRateController, CSRFTokenManager, warn, info, err, success, 
@@ -51,7 +53,7 @@ class HTTPClient:
         self._tlock = threading.Lock(); self._last = defaultdict(float)
         self.rate_controller = AdaptiveRateController(cfg.rps); self.csrf_manager = CSRFTokenManager(); self.lockout_guard = AccountLockoutGuard()
         self._per_host_limiters = defaultdict(lambda: threading.Semaphore(2)); self._host_limiter_lock = threading.Lock()
-        self._waf_name = "Generic"; self._waf_detected = False; self._framework = "Generic"; self._survived_chars = set(LDAP_METACHAR_SET)
+        self._waf_name = "Generic"; self._waf_detected = False; self._waf_delay = 0.0; self._waf_count = 0; self._framework = "Generic"; self._survived_chars = set(LDAP_METACHAR_SET)
         pool_size = min(cfg.threads, 4); self._unauth_pool = [self._build_session() for _ in range(pool_size)]; self._auth_pool = []; self._pool_idx = 0; self._pool_lock = threading.Lock()
         for s in self._unauth_pool:
             for n, v in cfg.cookies.items(): s.cookies.set(n, v)
@@ -124,7 +126,10 @@ class HTTPClient:
 
     def _handle_waf_response(self, status: int, body: str = "") -> None:
         if status in (403, 406, 429):
-            with self._tlock: self._waf_delay = min(self._waf_delay + 0.4, 3.0); self._waf_count += 1; self._waf_detected = True
+            with self._tlock:
+                self._waf_delay = min(getattr(self, "_waf_delay", 0) + 0.4, 3.0)
+                self._waf_count = getattr(self, "_waf_count", 0) + 1
+                self._waf_detected = True
             if not self._waf_name:
                 for name, pat in WAF_SIGS:
                     if pat.search(body): self._waf_name = name; break

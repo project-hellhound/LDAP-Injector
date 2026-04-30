@@ -6,11 +6,10 @@ from .detection import DetectionPipeline, CrossParamValidator, DetectionResult
 from .client import HTTPClient
 from .budget import AdaptiveBudgetManager
 from .learning import LearningMemory
-from .detection import DetectionPipeline, CrossParamValidator
 from .verification import ThreeStepVerifier
 from .fp_filter import FalsePositiveFilter
 from .oob import OOBListener
-from .utils import build_injection_data, build_safe_data, detect_msg, verbose, warn, info, vprint
+from .utils import build_injection_data, build_safe_data, detect_msg, verbose, warn, info, vprint, finding_id
 from .payloads import PayloadEngine, PolymorphicPayloadGenerator
 
 class InjectionEngine:
@@ -59,7 +58,25 @@ class InjectionEngine:
     def _handle_signal(self, ep: Endpoint, param: str, pl: Payload, bl: Baseline, res: DetectionResult, resp: Any, stype: str = "generic", framework: str = "generic") -> List[HandoffFinding]:
         self._memory.mark_success(ep.url, pl.raw)
         with self._lock: self._sig_count += 1
-        v_res = self._verifier.verify(ep, param, pl.raw, bl); grade = v_res["grade"]
-        # Simplified FP filter for brevity
-        hf = HandoffFinding(finding_id="FIXME", scan_id=self._cfg.scan_id, timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ"), endpoint_url=ep.url, http_method=ep.method, parameter_name=param, auth_state=ep.auth_state.value, payload_raw=pl.raw, payload_encoding="raw", payload_technique=pl.technique, payload_tier=pl.tier.name, verification_grade=grade.value, verification_steps=v_res.get("proof", []), reproduction_confidence=v_res.get("confidence", 0), severity=res.severity.name, severity_reason="Signal detected", baseline_response_class=bl.response_class, injected_response_class=res.response_class, detection_signals=[s.detector for s in res.signals], diff_ratio=0.0, timing_zscore=0, timing_delta_ms=0, ldap_error_snippet=None, filter_reflection=None, oob_triggered=False, curl_poc="", raw_http_request="", ldap_server_type=stype, framework_detected=framework, waf_detected=False, survived_metacharacters=[], cvss_vector="", cvss_score=0, remediation_guidance="", exploiter_context={}, non_destructive_confirmed=True, second_order=False, affected_ldap_attributes=[], schema_enumerated=False)
+        grade, proof = self._verifier.verify(ep, param, bl, pl)
+        hf = HandoffFinding(
+            finding_id=finding_id(),
+            scan_id=self._cfg.scan_id,
+            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            endpoint_url=ep.url,
+            http_method=ep.method,
+            parameter_name=param,
+            auth_state=ep.auth_state.value,
+            payload_raw=pl.raw,
+            payload_technique=pl.technique,
+            payload_tier=pl.tier.name,
+            verification_grade=grade.value,
+            reproduction_confidence=100 if grade == VerificationGrade.CONFIRMED else 50,
+            severity=res.severity.name,
+            cvss_score=8.5 if grade == VerificationGrade.CONFIRMED else 7.0,
+            verification_steps=[proof],
+            baseline_response_class=bl.response_class,
+            injected_response_class=res.response_class,
+            detection_signals=[s.detector for s in res.signals]
+        )
         return [hf]
