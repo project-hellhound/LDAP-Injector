@@ -3,8 +3,8 @@ import requests
 import json
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
-from .models import DetectionSignal, Severity, ResponseClass, Baseline, ScanConfig, Payload
-from .utils import classify_response, sim_delta, severity_from_score
+from .models import DetectionSignal, Severity, ResponseClass, Baseline, ScanConfig, Payload, Endpoint, PayloadTier
+from .utils import classify_response, sim_delta, severity_from_score, safe_val
 from .patterns import LDAP_ERRORS_RE, LDAP_ERRORS_LOW_RE, AUTH_SUCCESS_HIGH_RE, AUTH_SUCCESS_LOW_RE, AUTH_FAIL_RE, AUTH_FAIL_HTML_RE, PROTECTED_PATH_RE, LDAP_FILTER_REFLECT_RE, LDAP_METACHAR_SET
 
 @dataclass
